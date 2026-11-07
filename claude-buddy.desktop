@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Buddy
+Comment=Маленький помаранчевий друг на робочому столі
+Exec=/usr/bin/python3 /home/yasha/PycharmProjects/WelcomeScreen/ClaudeBuddy/buddy.py
+Icon=face-smile
+Terminal=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=5
