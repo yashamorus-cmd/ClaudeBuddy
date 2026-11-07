@@ -4,13 +4,18 @@
 Left click        -> it jumps in place.
 Double click      -> it says the next phrase right away.
 Drag with mouse   -> carry it somewhere else.
-Right click       -> it says goodbye and quits.
+Right click       -> menu: skins (hats, glasses, clothes), seasonal skins, quit.
 """
 
+import datetime as dt
+import json
 import math
 import os
 import random
 import time
+from pathlib import Path
+
+import skins
 
 # GNOME on Wayland does not let normal windows place themselves anywhere on
 # screen. Under XWayland (X11 compatibility) an override-redirect window can,
@@ -42,12 +47,13 @@ SPRITE = [
     "....L.R....L.R....",
 ]
 PX_W, PX_H = 3.5, 7  # one sprite pixel on screen (terminal cells are tall)
+FINE_H = PX_H / 2  # accessories use square pixels for finer detail (see skins.py)
 BODY_HALF_W = len(SPRITE[0]) * PX_W / 2
 BODY_HALF_H = len(SPRITE) * PX_H / 2
 BODY_R = int(BODY_HALF_W)  # rough radius, used for margins
 
 # The window is bigger than the character so the speech bubble fits above it.
-WIN_W, WIN_H = 220, 160
+WIN_W, WIN_H = 220, 190  # extra height leaves room for tall hats under the bubble
 CX, CY = WIN_W // 2, WIN_H - 30  # character centre inside the window
 
 # --- Behaviour ------------------------------------------------------------
@@ -137,6 +143,46 @@ CATCH_PHRASES = ["Спіймав курсор!", "Ось ти де!", "Попа�
 LOST_PHRASES = ["Загубив курсор 🤔", "Куди ж він подівся?", "Агов, курсоре?"]
 HELD_PHRASES = ["Ей, постав мене! 😳", "Ми летимо?!", "Обережно, я крихкий!"]
 DROP_PHRASES = ["Дякую!", "Тут затишно", "О, нове місце!"]
+SKIN_PHRASES = ["Як я тобі? 😎", "Стильно, правда?", "Новий образ!", "Мені личить?", "Красунчик!"]
+UNDRESS_PHRASES = ["Так легше 😌", "Повернувся до класики", "Мінімалізм!"]
+
+# --- Skins ------------------------------------------------------------------
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "claude-buddy" / "config.json"
+DEFAULT_CONFIG = {"head": None, "face": None, "body": None, "seasonal": True}
+
+
+def load_config() -> dict:
+    config = dict(DEFAULT_CONFIG)
+    try:
+        saved = json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        return config
+    for slot, (_title, items) in skins.SLOTS.items():
+        if saved.get(slot) in items:  # ignore accessories that no longer exist
+            config[slot] = saved[slot]
+    config["seasonal"] = bool(saved.get("seasonal", True))
+    return config
+
+
+def save_config(config: dict) -> None:
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONFIG_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(config, ensure_ascii=False, indent=2))
+        tmp.replace(CONFIG_PATH)  # atomic: a crash never leaves a half-written file
+    except OSError:
+        pass  # not being able to save a hat is no reason to crash
+
+
+def today() -> dt.date:
+    # BUDDY_DATE=2026-12-25 lets you preview seasonal skins on any day.
+    override = os.environ.get("BUDDY_DATE")
+    if override:
+        try:
+            return dt.date.fromisoformat(override)
+        except ValueError:
+            pass
+    return dt.date.today()
 
 # GTK names the double-click event differently in older versions.
 DOUBLE_CLICK = getattr(Gdk.EventType, "DOUBLE_BUTTON_PRESS", Gdk.EventType._2BUTTON_PRESS)
@@ -202,6 +248,15 @@ class Buddy(Gtk.Window):
         self.next_phrase_t = random.uniform(20, 40)  # the first one comes a bit sooner
         self.phrases = PhraseBag(PHRASES)
         self.quitting = False
+        self.menu: Gtk.Menu | None = None
+
+        self.config = load_config()
+        self.outfit: dict[str, skins.Accessory] = {}
+        self.season: skins.Season | None = None
+        self.refresh_outfit()
+        self.outfit_check_t = 60.0
+        if self.season and self.season.greeting:
+            self.say(self.season.greeting, 4)
 
         # Last seen cursor position and when it last changed (see POINTER_FRESH_S).
         self.last_pointer = self.pointer()
@@ -216,11 +271,127 @@ class Buddy(Gtk.Window):
 
     # --- Setup ------------------------------------------------------------
     def on_realize(self, _widget: Gtk.Widget) -> None:
-        # Only the character itself catches clicks; everything else in the
-        # window passes clicks through to whatever is underneath.
-        top = int(CY - BODY_HALF_H - 30)  # extra room above for the jump
-        rect = cairo.RectangleInt(int(CX - BODY_HALF_W), top, int(BODY_HALF_W * 2), WIN_H - top)
+        self.update_input_shape()
+
+    def update_input_shape(self) -> None:
+        # Only the character (with its hat or flag) catches clicks; everything else
+        # in the window passes clicks through to whatever is underneath.
+        if not self.get_realized():
+            return
+        left = CX - BODY_HALF_W
+        right = CX + BODY_HALF_W
+        top = CY - BODY_HALF_H
+        for acc in self.outfit.values():
+            left = min(left, CX - BODY_HALF_W + acc.col * PX_W)
+            right = max(right, CX - BODY_HALF_W + (acc.col + acc.width) * PX_W)
+            top = min(top, CY - BODY_HALF_H + acc.row * FINE_H - acc.float_amp)
+        top = int(top - 30)  # extra room above for the jump
+        rect = cairo.RectangleInt(int(left), top, int(right - left) + 1, WIN_H - top)
         self.input_shape_combine_region(cairo.Region(rect))
+
+    # --- Skins ------------------------------------------------------------
+    def refresh_outfit(self) -> None:
+        """Works out what the buddy wears: the user's choice plus today's season, if any."""
+        outfit = {}
+        for slot, (_title, items) in skins.SLOTS.items():
+            if self.config.get(slot) in items:
+                outfit[slot] = items[self.config[slot]]
+        self.season = skins.active_season(today()) if self.config["seasonal"] else None
+        if self.season:
+            outfit.update(self.season.outfit)  # the season wins only in the slots it uses
+        self.outfit = outfit
+        self.update_input_shape()
+
+    def body_color(self) -> tuple[float, float, float]:
+        return (self.season and self.season.body_color) or ORANGE
+
+    def eye_color(self) -> tuple[float, float, float]:
+        return (self.season and self.season.eye_color) or INK
+
+    def accessories_top(self) -> float:
+        """How far (px) the highest accessory sticks out above the head."""
+        top = 0.0
+        for acc in self.outfit.values():
+            top = min(top, acc.row * FINE_H - acc.float_amp)
+        return -top
+
+    def set_accessory(self, slot: str, acc_id: str | None) -> None:
+        if self.config.get(slot) == acc_id:
+            return
+        self.config[slot] = acc_id
+        save_config(self.config)
+        self.refresh_outfit()
+        self.jump_t = 0.6
+        self.say(random.choice(SKIN_PHRASES if acc_id else UNDRESS_PHRASES), 2.5)
+
+    def set_seasonal(self, enabled: bool) -> None:
+        if self.config["seasonal"] == enabled:
+            return
+        self.config["seasonal"] = enabled
+        save_config(self.config)
+        self.refresh_outfit()
+        if enabled and self.season:
+            self.say(self.season.greeting or random.choice(SKIN_PHRASES), 3)
+
+    # --- Menu -------------------------------------------------------------
+    def show_menu(self, event: Gdk.EventButton) -> None:
+        menu = Gtk.Menu()
+        # Show which slots the season currently overrides, so the choice is not confusing.
+        overridden = set(self.season.outfit) if self.season else set()
+
+        for slot, (title, items) in skins.SLOTS.items():
+            sub = Gtk.Menu()
+            group: Gtk.RadioMenuItem | None = None
+            current = self.config.get(slot)
+            for acc_id, label in [(None, "Немає"), *((k, a.name) for k, a in items.items())]:
+                item = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+                group = group or item
+                item.set_active(acc_id == current)
+                item.connect("toggled", self.on_radio, slot, acc_id)
+                sub.append(item)
+            label = title + (" (зараз сезонний)" if slot in overridden else "")
+            parent = Gtk.MenuItem(label=label)
+            parent.set_submenu(sub)
+            menu.append(parent)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        upcoming = skins.active_season(today())
+        seasonal_label = "Сезонні скіни" + (f" — зараз {upcoming.name}" if upcoming else "")
+        seasonal = Gtk.CheckMenuItem(label=seasonal_label)
+        seasonal.set_active(self.config["seasonal"])
+        seasonal.connect("toggled", lambda w: self.set_seasonal(w.get_active()))
+        menu.append(seasonal)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_item = Gtk.MenuItem(label="Вийти")
+        quit_item.connect("activate", lambda _w: self.quit_buddy())
+        menu.append(quit_item)
+
+        # Stand still while the menu is open, otherwise it would walk away from it.
+        prev_state = (self.state, self.state_time)
+        self.set_state("rest", math.inf)
+
+        def on_closed(_menu: Gtk.Menu) -> None:
+            if not self.quitting and self.state == "rest":
+                self.set_state(prev_state[0] if prev_state[0] != "held" else "rest",
+                               min(prev_state[1], 5.0))
+            self.menu = None
+
+        menu.connect("deactivate", on_closed)
+        menu.show_all()
+        menu.attach_to_widget(self, None)
+        self.menu = menu  # keep a reference so it is not garbage-collected while open
+        menu.popup_at_pointer(event)
+
+    def on_radio(self, item: Gtk.RadioMenuItem, slot: str, acc_id: str | None) -> None:
+        if item.get_active():  # "toggled" also fires for the item being switched off
+            self.set_accessory(slot, acc_id)
+
+    def quit_buddy(self) -> None:
+        self.quitting = True
+        self.set_state("rest", 999)
+        self.say("Бувай! 👋", 2)
+        GLib.timeout_add(1500, self.close)
 
     def move_window(self) -> None:
         self.move(int(self.x - CX), int(self.y - CY))
@@ -317,6 +488,15 @@ class Buddy(Gtk.Window):
         if self.jump_t > 0:
             self.jump_t = max(0.0, self.jump_t - dt)
 
+        # The buddy may run for days, so a season can start or end while it is on screen.
+        self.outfit_check_t -= dt
+        if self.outfit_check_t <= 0:
+            self.outfit_check_t = 60.0
+            old_season = self.season
+            self.refresh_outfit()
+            if self.season and self.season is not old_season and self.season.greeting:
+                self.say(self.season.greeting, 4)
+
         self.blink_t -= dt
         if self.blink_t < -0.15:
             self.blink_t = random.uniform(2, 6)
@@ -341,11 +521,9 @@ class Buddy(Gtk.Window):
     def on_press(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
         if self.quitting:
             return True
-        if event.button == 3:
-            self.quitting = True
-            self.set_state("rest", 999)
-            self.say("Бувай! 👋", 2)
-            GLib.timeout_add(1500, self.close)
+        if event.button == 3 and event.type == Gdk.EventType.BUTTON_PRESS:
+            self.press = None
+            self.show_menu(event)
         elif event.button == 1 and event.type == DOUBLE_CLICK:
             self.press = None
             self.jump_t = 0.6
@@ -402,9 +580,26 @@ class Buddy(Gtk.Window):
 
         self.draw_shadow(cr, jump)
         self.draw_sprite(cr, cy, moving)
+        # Clothes first, then face and hat on top, the seasonal extra last.
+        for slot in ("body", "face", "head", "extra"):
+            if slot in self.outfit:
+                self.draw_accessory(cr, self.outfit[slot], cy)
         if self.phrase:
-            self.draw_bubble(cr, cy)
+            self.draw_bubble(cr, cy - self.accessories_top())
         return False
+
+    def draw_accessory(self, cr: cairo.Context, acc: skins.Accessory, cy: float) -> None:
+        left = CX - BODY_HALF_W + acc.col * PX_W
+        top = cy - BODY_HALF_H + acc.row * FINE_H
+        if acc.float_amp:
+            top += round(math.sin(self.wobble * 2.5) * acc.float_amp)  # whole pixels, like the rest
+        for row, line in enumerate(acc.frame(self.wobble)):
+            for col, cell in enumerate(line):
+                if cell == ".":
+                    continue
+                cr.set_source_rgb(*acc.palette[cell])
+                cr.rectangle(left + col * PX_W, top + row * FINE_H, PX_W + 0.5, FINE_H + 0.5)
+                cr.fill()
 
     def draw_shadow(self, cr: cairo.Context, jump: float) -> None:
         scale = 1 - jump / 100
@@ -422,6 +617,7 @@ class Buddy(Gtk.Window):
         blinking = self.blink_t < 0
         # While walking one pair of legs is lifted, then the other.
         lifted = ("L" if math.sin(self.step_phase * 0.5) > 0 else "R") if moving else ""
+        body, eye = self.body_color(), self.eye_color()
 
         for row, line in enumerate(SPRITE):
             for col, cell in enumerate(line):
@@ -431,16 +627,16 @@ class Buddy(Gtk.Window):
                 y = top + row * PX_H
                 h = PX_H
                 if cell == "o":
-                    cr.set_source_rgb(*ORANGE)
+                    cr.set_source_rgb(*body)
                     cr.rectangle(x, y, PX_W + 0.5, PX_H + 0.5)
                     cr.fill()
                     if blinking:
                         y, h = y + PX_H * 0.7, PX_H * 0.3  # closed eye: thin line
-                    cr.set_source_rgb(*INK)
+                    cr.set_source_rgb(*eye)
                 else:
                     if cell == lifted:
                         h = PX_H * 0.5
-                    cr.set_source_rgb(*ORANGE)
+                    cr.set_source_rgb(*body)
                 # +0.5 hides hairline gaps between neighbouring pixels.
                 cr.rectangle(x, y, PX_W + 0.5, h + 0.5)
                 cr.fill()
