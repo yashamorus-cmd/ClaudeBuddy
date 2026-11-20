@@ -17,12 +17,14 @@
 3. `row` — у якому рядку сітки починається малюнок (мінус — над головою),
    `col` — з якої колонки.
 4. Додай аксесуар у потрібний словник (HEAD / FACE / BODY) — він сам з'явиться в меню.
+   Звірятка-компаньйони — у PETS (у них свій малюнок, див. клас Pet).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from typing import Callable
 
 Color = tuple[float, float, float]
 
@@ -416,6 +418,21 @@ SLOTS: dict[str, tuple[str, dict[str, Accessory]]] = {
 }
 
 # ---------------------------------------------------------------- сезонні аксесуари
+def _rolled(rows: tuple[str, ...], shift: int) -> tuple[str, ...]:
+    """Той самий малюнок, зсунутий на `shift` рядків униз по колу (для «падіння»)."""
+    shift %= len(rows)
+    return rows[-shift:] + rows[:-shift] if shift else rows
+
+
+_CONFETTI = (
+    "R.....B.....Y.....",
+    "....Y.....R.....B.",
+    "..B.....Y.....R...",
+    ".......R.....B...Y",
+    "Y..B.......Y......",
+    "......Y..R.....B..",
+)
+
 SEASONAL: dict[str, Accessory] = {
     "santa": Accessory(
         name="Шапка Санти",
@@ -475,46 +492,311 @@ SEASONAL: dict[str, Accessory] = {
         col=5,
         float_amp=3.0,
     ),
+    "star": Accessory(
+        name="Різдвяна зірка",
+        art=(
+            "........YY........",
+            "........YY........",
+            "....YYYYYYYYYY....",
+            "......YYYYYY......",
+            ".......YYYY.......",
+            "......YY..YY......",
+            ".....Y......Y.....",
+        ),
+        frames=((
+            "...W....YY....W...",
+            "........YY........",
+            "....YYYYYYYYYY....",
+            "......YYYYYY......",
+            "..W....YYYY....W..",
+            "......YY..YY......",
+            ".....Y......Y.....",
+        ),),
+        palette={"Y": (1.00, 0.84, 0.15), "W": (1.00, 1.00, 0.85)},
+        row=-9,
+        float_amp=2.0,
+        fps=2,
+    ),
+    "party_hat": Accessory(
+        name="Святковий ковпачок",
+        art=(
+            "........WW........",
+            "........PP........",
+            ".......PYYP.......",
+            ".......PPPP.......",
+            "......YYYYYY......",
+            "......PPPPPP......",
+            ".....BBBBBBBB.....",
+        ),
+        palette={"P": (0.95, 0.35, 0.65), "Y": (1.00, 0.85, 0.20),
+                 "B": (0.25, 0.55, 0.95), "W": (0.98, 0.98, 0.98)},
+        row=-7,
+    ),
+    "confetti": Accessory(
+        name="Конфеті",
+        art=_CONFETTI,
+        frames=tuple(_rolled(_CONFETTI, k) for k in range(1, len(_CONFETTI))),
+        palette={"R": (0.92, 0.25, 0.35), "B": (0.25, 0.55, 0.95), "Y": (1.00, 0.85, 0.20)},
+        row=-15,
+        fps=5,
+    ),
+    "pysanka": Accessory(
+        name="Писанка",
+        art=(
+            ".RR.",
+            "RYYR",
+            "WRRW",
+            "RYYR",
+            ".RR.",
+        ),
+        palette={"R": (0.80, 0.12, 0.15), "Y": (1.00, 0.84, 0.15), "W": (0.98, 0.98, 0.98)},
+        row=3,
+        col=16,
+    ),
+    "helmet": Accessory(
+        name="Шолом",
+        art=(
+            ".....OOOOOOOO.....",
+            "....OOOOOOOOOO....",
+            "...OOOOOOOOOOOO...",
+            "..DDDDDDDDDDDDDD..",
+        ),
+        palette={"O": (0.36, 0.44, 0.24), "D": (0.24, 0.30, 0.16)},
+        row=-4,
+    ),
 }
+
+# Аксесуари погоди: вдягаються самі, коли в твоєму місті дощ (див. weather.py).
+WEATHER: dict[str, Accessory] = {
+    "umbrella": Accessory(
+        name="Парасолька",
+        art=(
+            "........WW........",
+            "......BBBBBB......",
+            "...BBBBBBBBBBBB...",
+            ".BBBBBBBBBBBBBBBB.",
+            "BBBBBBBBBBBBBBBBBB",
+            "B.LL.BB.LL.BB.LL.K",
+            ".................K",
+            ".................K",
+            ".................K",
+            ".................K",
+            ".................K",
+            ".................K",
+            ".................K",
+            ".................K",
+            "................KK",
+        ),
+        palette={"B": (0.25, 0.45, 0.85), "L": (0.45, 0.65, 0.95), "W": (0.97, 0.97, 0.97),
+                 "K": (0.30, 0.22, 0.15)},
+        row=-12,
+    ),
+}
+
+
+# ---------------------------------------------------------------- компаньйони
+@dataclass(frozen=True)
+class Pet:
+    """Звірятко, що ходить поруч. Малюнок дивиться праворуч; ліворуч він дзеркалиться."""
+    name: str
+    frames: tuple[tuple[str, ...], ...]  # кадри ходьби, перший — коли стоїть
+    palette: dict[str, Color]
+    sound: str = ""  # що каже, коли бадді його гладить
+
+    @property
+    def width(self) -> int:
+        return len(self.frames[0][0])
+
+    @property
+    def height(self) -> int:
+        return len(self.frames[0])
+
+
+PETS: dict[str, Pet] = {
+    "cat": Pet(
+        name="Котик",
+        frames=(
+            (
+                "K.......K.K",
+                ".K......KKK",
+                ".K......KYK",
+                "..KKKKKKKKK",
+                "..KKKKKKKK.",
+                "..K.K..K.K.",
+            ),
+            (
+                "K.......K.K",
+                ".K......KKK",
+                ".K......KYK",
+                "..KKKKKKKKK",
+                "..KKKKKKKK.",
+                "...K.K..K.K",
+            ),
+        ),
+        palette={"K": (0.30, 0.30, 0.34), "Y": (0.95, 0.85, 0.25)},
+        sound="Мяу! 🐱",
+    ),
+    "dog": Pet(
+        name="Песик",
+        frames=(
+            (
+                "........NNN.",
+                "N......NNKNE",
+                ".N.....NNNNN",
+                "..NNNNNNNN..",
+                "..NNNNNNNN..",
+                "..N.N..N.N..",
+            ),
+            (
+                "........NNN.",
+                "N......NNKNE",
+                ".N.....NNNNN",
+                "..NNNNNNNN..",
+                "..NNNNNNNN..",
+                "...N.N..N.N.",
+            ),
+        ),
+        palette={"N": (0.62, 0.42, 0.24), "K": (0.10, 0.08, 0.06), "E": (0.20, 0.12, 0.08)},
+        sound="Гав! 🐶",
+    ),
+    "chick": Pet(
+        name="Курчатко",
+        frames=(
+            (
+                "..YY...",
+                ".YYKY..",
+                ".YYYYO.",
+                "YYYYY..",
+                ".YYYY..",
+                "..O.O..",
+            ),
+            (
+                "..YY...",
+                ".YYKY..",
+                ".YYYYO.",
+                "YYYYY..",
+                ".YYYY..",
+                ".O...O.",
+            ),
+        ),
+        palette={"Y": (1.00, 0.85, 0.20), "K": (0.10, 0.08, 0.06), "O": (0.95, 0.50, 0.10)},
+        sound="Пі-пі! 🐥",
+    ),
+}
+
+
+# ---------------------------------------------------------------- сезони
+DateRule = Callable[[dt.date], bool]
+
+
+def between(start: tuple[int, int], end: tuple[int, int]) -> DateRule:
+    """Щороку з (місяць, день) до (місяць, день) включно; може переходити через Новий рік."""
+    def rule(day: dt.date) -> bool:
+        md = (day.month, day.day)
+        if start <= end:
+            return start <= md <= end
+        return md >= start or md <= end
+    return rule
+
+
+def orthodox_easter(year: int) -> dt.date:
+    """Великдень за юліанською пасхалією, переведений у наш календар (1900–2099)."""
+    a, b, c = year % 4, year % 7, year % 19
+    d = (19 * c + 15) % 30
+    e = (2 * a + 4 * b - d + 34) % 7
+    month, day = divmod(d + e + 114, 31)
+    return dt.date(year, month, day + 1) + dt.timedelta(days=13)
+
+
+def vyshyvanka_day(year: int) -> dt.date:
+    """День вишиванки — третій четвер травня."""
+    first = dt.date(year, 5, 1)
+    first_thursday = first + dt.timedelta(days=(3 - first.weekday()) % 7)
+    return first_thursday + dt.timedelta(weeks=2)
+
+
+def easter_days(day: dt.date) -> bool:
+    easter = orthodox_easter(day.year)
+    return easter <= day <= easter + dt.timedelta(days=1)
 
 
 @dataclass(frozen=True)
 class Season:
     name: str
-    start: tuple[int, int]  # (місяць, день), включно
-    end: tuple[int, int]
+    when: DateRule = field(compare=False)
     outfit: dict[str, Accessory] = field(default_factory=dict)  # слот -> аксесуар
     greeting: str = ""
     body_color: Color | None = None
     eye_color: Color | None = None
 
     def is_active(self, day: dt.date) -> bool:
-        md = (day.month, day.day)
-        if self.start <= self.end:
-            return self.start <= md <= self.end
-        return md >= self.start or md <= self.end  # період через Новий рік
+        return self.when(day)
 
 
 SEASONS: list[Season] = [
-    Season("Новорічний 🎅", (12, 15), (1, 15), {"head": SEASONAL["santa"]},
+    # Порядок важливий: якщо свята збігаються, перемагає те, що вище.
+    Season("Різдво 🌟", between((12, 24), (12, 25)),
+           {"head": SEASONAL["star"], "body": BODY["scarf"]},
+           greeting="З Різдвом! 🌟 Христос народився!"),
+    Season("Новорічний 🎅", between((12, 15), (1, 15)), {"head": SEASONAL["santa"]},
            greeting="Хо-хо-хо! 🎅🎄"),
-    Season("Хелловін 🎃", (10, 25), (11, 2), {"head": SEASONAL["witch"]},
+    Season("Великдень 🥚", easter_days,
+           {"body": BODY["vyshyvanka"], "extra": SEASONAL["pysanka"]},
+           greeting="Христос воскрес! 🥚🌸"),
+    Season("Хелловін 🎃", between((10, 25), (11, 2)), {"head": SEASONAL["witch"]},
            greeting="Бу! 🎃 Страшно?", body_color=(0.93, 0.48, 0.13), eye_color=(0.70, 1.00, 0.25)),
-    Season("День Незалежності 💙💛", (8, 23), (8, 25),
+    Season("День захисників 💙💛", between((10, 1), (10, 1)),
+           {"head": SEASONAL["helmet"], "extra": SEASONAL["flag"]},
+           greeting="Дякуємо захисникам і захисницям! 💙💛"),
+    Season("День вишиванки 🌻", lambda day: day == vyshyvanka_day(day.year),
+           {"body": BODY["vyshyvanka"], "head": HEAD["wreath"]},
+           greeting="З Днем вишиванки! 🌻"),
+    Season("День Незалежності 💙💛", between((8, 23), (8, 25)),
            {"body": BODY["vyshyvanka"], "extra": SEASONAL["flag"]},
            greeting="Слава Україні! 💙💛"),
-    Season("День закоханих ❤️", (2, 14), (2, 14), {"extra": SEASONAL["hearts"]},
+    Season("День закоханих ❤️", between((2, 14), (2, 14)), {"extra": SEASONAL["hearts"]},
            greeting="Люблю тебе, друже! ❤️"),
 ]
 
 
-def active_season(day: dt.date) -> Season | None:
-    return next((s for s in SEASONS if s.is_active(day)), None)
+def parse_birthday(value: object) -> tuple[int, int] | None:
+    """"MM-DD" -> (місяць, день); усе інше -> None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        month, day = (int(part) for part in value.split("-"))
+        dt.date(2000, month, day)  # 2000 — високосний, тож 29 лютого теж підходить
+    except ValueError:
+        return None
+    return month, day
+
+
+def birthday_season(birthday: tuple[int, int]) -> Season:
+    month, day = birthday
+
+    def rule(today: dt.date) -> bool:
+        # Народився 29 лютого? У невисокосний рік святкуємо 28-го.
+        if (month, day) == (2, 29) and not _is_leap(today.year):
+            return (today.month, today.day) == (2, 28)
+        return (today.month, today.day) == (month, day)
+
+    return Season("Твій день народження 🎂", rule,
+                  {"head": SEASONAL["party_hat"], "extra": SEASONAL["confetti"]},
+                  greeting="З днем народження! 🎂🎉\nТи найкращий!")
+
+
+def _is_leap(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+
+
+def active_season(day: dt.date, birthday: tuple[int, int] | None = None) -> Season | None:
+    seasons = ([birthday_season(birthday)] if birthday else []) + SEASONS
+    return next((s for s in seasons if s.is_active(day)), None)
 
 
 def _validate() -> None:
     """Ловить помилки в малюнках одразу при запуску, а не під час малювання."""
-    all_acc = [*HEAD.values(), *FACE.values(), *BODY.values(), *SEASONAL.values()]
+    all_acc = [*HEAD.values(), *FACE.values(), *BODY.values(), *SEASONAL.values(), *WEATHER.values()]
     for acc in all_acc:
         for art in acc.all_frames:
             widths = {len(line) for line in art}
@@ -523,6 +805,13 @@ def _validate() -> None:
             for line in art:
                 for ch in line:
                     assert ch == "." or ch in acc.palette, f"{acc.name}: немає кольору для «{ch}»"
+    for pet in PETS.values():
+        for art in pet.frames:
+            assert {len(line) for line in art} == {pet.width}, f"{pet.name}: рядки різної довжини"
+            assert len(art) == pet.height, f"{pet.name}: кадри різної висоти"
+            for line in art:
+                for ch in line:
+                    assert ch == "." or ch in pet.palette, f"{pet.name}: немає кольору для «{ch}»"
 
 
 _validate()
