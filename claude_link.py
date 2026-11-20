@@ -34,6 +34,50 @@ def send(event: dict) -> bool:
         return False
 
 
+# Команда Bash -> що сказати. Перевіряються по черзі, перша збіжна перемагає.
+COMMAND_PATTERNS: list[tuple[tuple[str, ...], str]] = [
+    (("git push",), "Відправляю на GitHub 🚀"),
+    (("git commit",), "Комічу 💾"),
+    (("pytest", "unittest", "npm test", "npm run test", "vitest", "jest", "gradle test",
+      "go test", "cargo test", "bun test"), "Запускаю тести 🧪"),
+    (("eslint", "ruff", "pyflakes", "flake8", "npm run lint", "tsc --noemit"), "Перевіряю код 🔍"),
+    (("npm run build", "vite build", "assemble", "gradle build", "cargo build", "make ",
+      "tsc", "docker build"), "Збираю проєкт 🔨"),
+    (("npm install", "npm i ", "pip install", "apt install", "pnpm add", "yarn add",
+      "bun add", "uv add"), "Встановлюю пакети 📦"),
+    (("curl ", "wget "), "Ходжу в інтернет 🌐"),
+]
+
+FILE_TOOLS = {"Edit": "Редагую", "MultiEdit": "Редагую", "Write": "Пишу", "NotebookEdit": "Редагую"}
+
+
+def describe_tool(tool: str, detail: str) -> str | None:
+    """Що Claude зараз робить, людською мовою; None — нічого цікавого, мовчимо."""
+    if tool == "Bash":
+        command = f" {detail.lower()} "
+        for patterns, text in COMMAND_PATTERNS:
+            if any(p in command for p in patterns):
+                return text
+        return None
+    if tool in FILE_TOOLS:
+        name = Path(detail).name if detail else "файл"
+        return f"{FILE_TOOLS[tool]} {name} ✏️"
+    return None
+
+
+def describe_failure(tool: str) -> str:
+    return "Ой, команда впала 😬" if tool == "Bash" else "Ой, щось не вийшло 😬"
+
+
+def tool_detail(tool: str, tool_input: object) -> str:
+    """З усього, що Claude передає інструменту, бадді потрібна лише команда або ім'я файлу."""
+    if not isinstance(tool_input, dict):
+        return ""
+    if tool == "Bash":
+        return str(tool_input.get("command", ""))[:300]
+    return str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")[:300]
+
+
 class Listener:
     """Бік бадді: слухає сокет. fileno() віддаємо GLib, щоб не блокувати екран."""
 

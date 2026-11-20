@@ -7,8 +7,9 @@ Drag with mouse   -> carry it somewhere else.
 Right click       -> menu: feed, games, word of the day, pomodoro, skins, pet,
                      weather, settings, restart, quit.
 
-It also reacts to Claude Code (see buddy_hook.py), falls asleep when you are away,
-and restarts by itself when its own code changes.
+It also reacts to Claude Code (see buddy_hook.py), dances to music, falls asleep
+when you are away, reminds you about breaks, commits and your own reminders, levels up
+with achievements, and restarts by itself when its own code changes.
 """
 
 import datetime as dt
@@ -24,7 +25,14 @@ import time
 from pathlib import Path
 
 import claude_link
+import gitwatch
+import install
+import lesson
+import progress
+import reminders
 import skins
+import sounds
+import sysinfo
 import tamagotchi
 import weather
 import words
@@ -41,6 +49,10 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("PangoCairo", "1.0")
 from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+
+import music  # noqa: E402  (uses D-Bus from gi, so it comes after the backend choice)
+from lesson_window import LessonWindow  # noqa: E402
+from settings_window import SettingsWindow  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 LOG_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "claude-buddy" / "log.txt"
@@ -115,6 +127,27 @@ PET_AMOUNT = 3  # mood for a pat
 
 WEATHER_REFRESH_S = 30 * 60
 CODE_CHECK_S = 2  # how often to look for changes in its own code
+MUSIC_CHECK_S = 3
+DANCE_BPM = 108
+
+GIT_CHECK_S = 15 * 60  # how often to look for forgotten commits
+GIT_STALE_S = 2 * 3600  # changes older than this deserve a reminder
+GIT_REPEAT_S = 2 * 3600  # the same project at most this often
+GIT_GAP_S = 20 * 60  # any commit reminder at most this often
+GIT_DEFAULT_ROOTS = ["~/PycharmProjects", "~/Projects", "~/projects", "~/code", "~/src"]
+
+SYSTEM_CHECK_S = 30
+CPU_HOT_C = 85
+RAM_FULL_PCT = 92
+DISK_LOW_GB = 5
+WORK_NO_BREAK_S = 3 * 3600  # this long without a break -> suggest one
+BREAK_IDLE_S = 5 * 60  # away this long = you had a break
+
+TOOL_BUBBLE_GAP_S = 4  # "Editing file…" bubbles at most this often
+
+LESSON_NUDGE_FROM_HOUR = 10  # remind about the lesson not earlier than this
+LESSON_NUDGE_EVERY_S = 3 * 3600
+LESSON_NUDGES_PER_DAY = 3
 
 BUDDY_PHRASES = [
     "Не забудь попити води! 💧",
@@ -222,6 +255,14 @@ DEFAULT_CONFIG = {
     "claude": True,
     "birthday": None,  # "MM-DD"
     "city": None,  # {"name", "lat", "lon"}
+    "sounds": True,
+    "claude_tools": True,  # show what Claude is doing (tests, commits, files)
+    "git_reminders": True,
+    "git_roots": [],  # empty -> GIT_DEFAULT_ROOTS
+    "word_topics": {key: True for key in words.TOPICS},
+    "goal_date": lesson.DEFAULT_GOAL.isoformat(),  # learn all the words by this day
+    "lesson_autospeak": True,  # say every new word aloud on its card
+    "lesson_nudges": True,
 }
 
 
@@ -239,9 +280,20 @@ def load_config() -> dict:
             config[slot] = saved[slot]
     if saved.get("pet") in skins.PETS:
         config["pet"] = saved["pet"]
-    for key in ("seasonal", "dnd", "claude"):
+    for key in ("seasonal", "dnd", "claude", "sounds", "claude_tools", "git_reminders",
+                "lesson_autospeak", "lesson_nudges"):
         if isinstance(saved.get(key), bool):
             config[key] = saved[key]
+    roots = saved.get("git_roots")
+    if isinstance(roots, list):
+        config["git_roots"] = [str(r) for r in roots if isinstance(r, str) and r.strip()]
+    if isinstance(saved.get("goal_date"), str):
+        config["goal_date"] = lesson.parse_goal(saved["goal_date"]).isoformat()
+    word_topics = saved.get("word_topics")
+    if isinstance(word_topics, dict):
+        for key in words.TOPICS:
+            if isinstance(word_topics.get(key), bool):
+                config["word_topics"][key] = word_topics[key]
     if saved.get("talk") in TALK_INTERVALS:
         config["talk"] = saved["talk"]
     topics = saved.get("topics")
@@ -295,13 +347,26 @@ def is_night(now: dt.datetime) -> bool:
     return now.hour >= start or now.hour < end
 
 
-def times_word(n: int) -> str:
-    """1 раз, 2 рази, 5 разів."""
+def plural(n: int, one: str, few: str, many: str) -> str:
+    """Українська множина: 1 раз, 2 рази, 5 разів."""
     if n % 10 == 1 and n % 100 != 11:
-        return "раз"
+        return one
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        return "рази"
-    return "разів"
+        return few
+    return many
+
+
+def times_word(n: int) -> str:
+    return plural(n, "раз", "рази", "разів")
+
+
+def duration_text(seconds: float) -> str:
+    """3 години, 2 дні."""
+    hours = int(seconds // 3600)
+    if hours >= 48:
+        days = hours // 24
+        return f"{days} {plural(days, 'день', 'дні', 'днів')}"
+    return f"{hours} {plural(hours, 'годину', 'години', 'годин')}"
 
 
 def newest_code_mtime() -> float:
@@ -431,6 +496,30 @@ class Buddy(Gtk.Window):
         self.code_seen = self.code_loaded
         self.code_seen_at = time.monotonic()
 
+        self.tracker = progress.Tracker()
+        self.sound = sounds.Player()
+        self.sound.prepare()
+        self.music = music.MusicWatcher()
+        self.track: music.Track | None = None
+        self.announced_track: music.Track | None = None
+        self.dance_t = 0.0  # seconds danced since the last full minute
+        self.reminders = reminders.load()
+        self.light_phrase = False  # the bubble shows a minor note that anything may replace
+        self.last_light = 0.0
+        self.settings_window: SettingsWindow | None = None
+        self.lesson_window: LessonWindow | None = None
+        self.lesson_nudges: dict[str, object] = {"day": "", "count": 0, "last": -math.inf}
+        self.warned: dict[str, float] = {}  # warning -> when it was last said (monotonic)
+        self.active_since: float | None = None  # when you sat down at the computer (Unix time)
+        self.next_break_nag = 0.0
+        self.owl_key = ""
+        self.git_busy = False
+        self.git_warned: dict[str, float] = {}
+        self.git_last = -math.inf
+        # Not right at start: first say hello, then nag about commits.
+        self.timers["git"] = time.monotonic() + 120
+        self.timers["lesson"] = time.monotonic() + 90
+
         self.outfit: dict[str, skins.Accessory] = {}
         self.season: skins.Season | None = None
         self.refresh_outfit()
@@ -524,7 +613,7 @@ class Buddy(Gtk.Window):
         """Works out what the buddy wears: your choice, today's season and the weather."""
         outfit = {}
         for slot, (_title, items) in skins.SLOTS.items():
-            if self.config.get(slot) in items:
+            if self.config.get(slot) in items and self.skin_unlocked(slot, self.config[slot]):
                 outfit[slot] = items[self.config[slot]]
         if self.config["seasonal"]:
             self.season = skins.active_season(today(), skins.parse_birthday(self.config["birthday"]))
@@ -536,6 +625,10 @@ class Buddy(Gtk.Window):
             outfit["weather"] = skins.WEATHER["umbrella"]
         self.outfit = outfit
         self.update_input_shape()
+
+    def skin_unlocked(self, slot: str, acc_id: str) -> bool:
+        achievement = skins.LOCKED.get(slot, {}).get(acc_id)
+        return achievement is None or self.tracker.is_unlocked(achievement)
 
     def body_color(self) -> tuple[float, float, float]:
         base = (self.season and self.season.body_color) or ORANGE
@@ -606,6 +699,59 @@ class Buddy(Gtk.Window):
         save_config(self.config)
         self.say("Стежу за Claude 👀" if enabled else "Більше не слідкую за Claude", 2)
 
+    def set_sounds(self, enabled: bool) -> None:
+        self.config["sounds"] = enabled
+        save_config(self.config)
+        if enabled:
+            self.sound.play("done")
+        self.say("Звук увімкнено 🔊" if enabled else "Тиша 🔇", 2)
+
+    def set_claude_tools(self, enabled: bool) -> None:
+        self.config["claude_tools"] = enabled
+        save_config(self.config)
+
+    def set_git_reminders(self, enabled: bool) -> None:
+        self.config["git_reminders"] = enabled
+        save_config(self.config)
+
+    def set_git_roots(self, text: str) -> None:
+        roots = [part.strip() for part in text.split(",") if part.strip()]
+        if roots != self.config["git_roots"]:
+            self.config["git_roots"] = roots
+            save_config(self.config)
+
+    def set_word_topic(self, key: str, enabled: bool) -> None:
+        self.config["word_topics"][key] = enabled
+        save_config(self.config)
+
+    def set_lesson_autospeak(self, enabled: bool) -> None:
+        self.config["lesson_autospeak"] = enabled
+        save_config(self.config)
+
+    def set_lesson_nudges(self, enabled: bool) -> None:
+        self.config["lesson_nudges"] = enabled
+        save_config(self.config)
+
+    def is_autostart(self) -> bool:
+        return install.is_autostart()
+
+    def set_autostart(self, enabled: bool) -> None:
+        try:
+            install.set_autostart(enabled)
+        except OSError as e:
+            self.say(f"Не вийшло: {e}", 3)
+            return
+        self.say("Буду з тобою з самого ранку! 🌅" if enabled else "Добре, запускай мене сам 🙂", 2.5)
+
+    def open_settings(self, page: str | None = None) -> None:
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self)
+            self.settings_window.show_all()
+            self.settings_window.refresh()  # hides what should be hidden after show_all
+        if page:
+            self.settings_window.show_page(page)
+        self.settings_window.present()
+
     def set_dnd(self, enabled: bool) -> None:
         self.config["dnd"] = enabled
         save_config(self.config)
@@ -637,10 +783,13 @@ class Buddy(Gtk.Window):
     def radio_menu(options: list[tuple], current, on_pick) -> Gtk.Menu:
         menu = Gtk.Menu()
         group: Gtk.RadioMenuItem | None = None
-        for value, label in options:
+        for option in options:
+            value, label = option[0], option[1]
+            sensitive = option[2] if len(option) > 2 else True
             item = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
             group = group or item
             item.set_active(value == current)
+            item.set_sensitive(sensitive)
             # "toggled" also fires for the item being switched off, hence get_active().
             item.connect("toggled", lambda w, v=value: w.get_active() and on_pick(v))
             menu.append(item)
@@ -654,10 +803,23 @@ class Buddy(Gtk.Window):
         stats = Gtk.MenuItem(label=f"🍎 Ситість {self.needs.satiety:.0f}%  ·  💛 Настрій {self.needs.mood:.0f}%")
         stats.set_sensitive(False)
         add(stats)
-        add(self.menu_item("Погодувати 🍎", self.feed))
+        p = self.tracker.p
+        next_xp = progress.xp_for(p.level + 1)
+        add(self.menu_item(f"🏆 Рівень {p.level} · {p.xp}/{next_xp} XP", lambda: self.open_settings("Прогрес")))
+        if self.track:
+            playing = Gtk.MenuItem(label=f"🎵 {self.track.label()}"[:60])
+            playing.set_sensitive(False)
+            add(playing)
+        if self.config["city"] and self.weather_now:
+            w = self.weather_now
+            forecast = Gtk.MenuItem(label=f"🌦 {self.config['city']['name']}: {w.temp:+.0f}°, {w.label}")
+            forecast.set_sensitive(False)
+            add(forecast)
+        add(Gtk.SeparatorMenuItem())
 
+        add(self.menu_item("Погодувати 🍎", self.feed))
         play = Gtk.Menu()
-        question = words.random_question()
+        question = words.random_question(self.word_pool(), p.word_book, today())
         quiz = Gtk.Menu()
         for option in question.options:
             quiz.append(self.menu_item(option, lambda o=option: self.answer_quiz(question, o)))
@@ -666,52 +828,31 @@ class Buddy(Gtk.Window):
         play.append(self.menu_item(f"🏃 Спіймай мене!{record}", self.start_game))
         add(self.submenu_item("Погратися ⚽", play))
 
-        add(self.menu_item(f"📖 Слово дня: {words.word_of_day(today()).en}", self.tell_word))
+        add(self.menu_item(self.lesson_label(), self.open_lesson))
+        add(self.menu_item(f"📖 Слово дня: {self.todays_word().en}", self.tell_word))
         add(self.menu_item(self.pomodoro_label(), self.toggle_pomodoro))
+        add(self.submenu_item(f"⏰ Нагадування ({len(self.reminders)})" if self.reminders else "⏰ Нагадування",
+                              self.reminders_menu()))
         add(Gtk.SeparatorMenuItem())
 
         # Show which slots the season currently overrides, so the choice is not confusing.
         overridden = set(self.season.outfit) if self.season else set()
         for slot, (title, items) in skins.SLOTS.items():
-            options = [(None, "Немає"), *((k, a.name) for k, a in items.items())]
+            options = [(None, "Немає", True)]
+            for acc_id, acc in items.items():
+                if self.skin_unlocked(slot, acc_id):
+                    options.append((acc_id, acc.name, True))
+                else:
+                    how = progress.BY_ID[skins.LOCKED[slot][acc_id]].description.lower()
+                    options.append((acc_id, f"🔒 {acc.name} ({how})", False))
             sub = self.radio_menu(options, self.config.get(slot), lambda v, s=slot: self.set_accessory(s, v))
             add(self.submenu_item(title + (" (зараз сезонний)" if slot in overridden else ""), sub))
-        pets = [(None, "Немає"), *((k, p.name) for k, p in skins.PETS.items())]
+        pets = [(None, "Немає"), *((k, pet.name) for k, pet in skins.PETS.items())]
         add(self.submenu_item("Компаньйон 🐾", self.radio_menu(pets, self.config["pet"], self.set_pet)))
-
-        birthday = skins.parse_birthday(self.config["birthday"])
-        upcoming = skins.active_season(today(), birthday)
-        seasonal_label = "Сезонні скіни" + (f" — зараз {upcoming.name}" if upcoming else "")
-        add(self.check_item(seasonal_label, self.config["seasonal"], self.set_seasonal))
-        when = f" ({birthday[1]:02d}.{birthday[0]:02d})" if birthday else ""
-        add(self.menu_item(f"🎂 Мій день народження…{when}", self.ask_birthday))
-
-        city = self.config["city"]
-        if city:
-            if self.weather_now:
-                label = f"🌦 {city['name']}: {self.weather_now.temp:+.0f}°, {self.weather_now.label}"
-            else:
-                label = f"🌦 Погода: {city['name']} (оновлюю…)"
-            sub = Gtk.Menu()
-            sub.append(self.menu_item("Оновити зараз", self.fetch_weather))
-            sub.append(self.menu_item("Змінити місто…", self.ask_city))
-            sub.append(self.menu_item("Вимкнути погоду", self.disable_weather))
-            add(self.submenu_item(label, sub))
-        else:
-            add(self.menu_item("🌦 Погода: вказати місто…", self.ask_city))
         add(Gtk.SeparatorMenuItem())
 
-        settings = Gtk.Menu()
-        talk = [(k, TALK_LABELS[k]) for k in TALK_INTERVALS]
-        settings.append(self.submenu_item("Як часто говорить", self.radio_menu(talk, self.config["talk"], self.set_talk)))
-        topics = Gtk.Menu()
-        for key, (title, _phrases) in TOPICS.items():
-            topics.append(self.check_item(title, self.config["topics"][key], lambda on, k=key: self.set_topic(k, on)))
-        settings.append(self.submenu_item("Про що говорить", topics))
-        settings.append(self.check_item("Сповіщення від Claude Code", self.config["claude"], self.set_claude))
-        add(self.submenu_item("⚙️ Налаштування", settings))
         add(self.check_item("🔕 Не заважати", self.config["dnd"], self.set_dnd))
-        add(Gtk.SeparatorMenuItem())
+        add(self.menu_item("⚙️ Налаштування…", self.open_settings))
         add(self.menu_item("🔄 Перезапустити", lambda: self.restart("Перезапускаюсь… 🔄")))
         add(self.menu_item("Вийти", self.quit_buddy))
 
@@ -872,6 +1013,28 @@ class Buddy(Gtk.Window):
         self.refresh_outfit()
         self.say("Добре, без погоди 🌤", 2)
 
+    # --- Progress and sounds ----------------------------------------------
+    def play_sound(self, name: str) -> None:
+        if self.config["sounds"] and not self.config["dnd"]:
+            self.sound.play(name)
+
+    def celebrate(self, gains: progress.Gains) -> None:
+        """Tells about a new level or achievement after anything that gave experience."""
+        if gains.level_up:
+            self.start_jump(3)
+            self.play_sound("level")
+            self.queue_say(f"Новий рівень {gains.level_up}! 🎉", 4)
+        for achievement in gains.unlocked:
+            text = f"🏆 Досягнення: {achievement.name}"
+            if achievement.reward:
+                slot, acc_id = achievement.reward
+                text += f"\n🎁 Новий скін: {skins.SLOTS[slot][1][acc_id].name}"
+            self.play_sound("achievement")
+            self.queue_say(text, 5)
+
+    def record(self, event: str, amount: int = 1) -> None:
+        self.celebrate(self.tracker.add(event, amount, today()))
+
     # --- Tamagotchi -------------------------------------------------------
     def feed(self) -> None:
         self.wake_quietly()
@@ -882,20 +1045,35 @@ class Buddy(Gtk.Window):
         self.was_hungry = self.needs.hungry
         self.save_life()
         self.say(random.choice(FED_PHRASES), 2.5)
+        self.record("feed")
+
+    # --- Words ------------------------------------------------------------
+    def word_pool(self) -> list[words.Word]:
+        return words.pool(self.config["word_topics"])
+
+    def todays_word(self) -> words.Word:
+        plan = self.lesson_plan()
+        if plan.new:  # слово дня — перше з сьогоднішнього уроку
+            return plan.new[0]
+        return self.tracker.word_of_day(today(), self.word_pool())
+
+    def word_text(self) -> str:
+        w = self.todays_word()
+        return f"📖 Слово дня: {w.en} — {w.uk}\n{w.example_en}\n({w.example_uk})"
 
     def tell_word(self) -> None:
         self.wake_quietly()
         self.say(self.word_text(), 9)
+        words.mark_seen(self.tracker.p.word_book, self.todays_word(), today())
         day = today().isoformat()
         if self.life.learned_day != day:  # learning makes it happy, once a day
             self.life.learned_day = day
             self.needs.cheer(10)
             self.save_life()
             self.queue_say("Молодець, що вчишся! 💛", 2.5)
-
-    def word_text(self) -> str:
-        w = words.word_of_day(today())
-        return f"📖 Слово дня: {w.en} — {w.uk}\n{w.example_en}\n({w.example_uk})"
+            self.record("word")
+        else:
+            self.tracker.save()
 
     def maybe_word_of_day(self) -> None:
         day = today().isoformat()
@@ -904,19 +1082,127 @@ class Buddy(Gtk.Window):
             self.save_life()
             self.queue_say(self.word_text(), 9)
 
+    # --- Lessons ----------------------------------------------------------
+    @staticmethod
+    def today() -> dt.date:
+        return today()
+
+    def goal_date(self) -> dt.date:
+        return lesson.parse_goal(self.config["goal_date"])
+
+    def lesson_plan(self) -> lesson.Plan:
+        p = self.tracker.p
+        plan, state = lesson.today_plan(p.lesson, p.word_book, self.word_pool(), today(), self.goal_date())
+        if state != p.lesson:
+            p.lesson = state
+            self.tracker.save()
+        return plan
+
+    def lesson_extra(self) -> list[words.Word]:
+        p = self.tracker.p
+        extra = lesson.add_extra(p.lesson, p.word_book, self.word_pool())
+        self.tracker.save()
+        return extra
+
+    def lesson_label(self) -> str:
+        plan = self.lesson_plan()
+        if plan.done:
+            return "📚 Урок зроблено ✅ (ще 5 слів?)"
+        parts = []
+        if plan.new:
+            parts.append(f"{len(plan.new)} нових")
+        if plan.reviews:
+            parts.append(f"{len(plan.reviews)} повторити")
+        return "📚 Урок: " + (", ".join(parts) if parts else "повторення")
+
+    def open_lesson(self) -> None:
+        self.wake_quietly()
+        if self.lesson_window is None:
+            self.lesson_window = LessonWindow(self)
+            self.lesson_window.show_all()
+        self.lesson_window.present()
+
+    def lesson_finished(self, gains: progress.Gains, stats: dict) -> None:
+        self.needs.cheer(10)
+        self.save_life()
+        self.play_sound("level")
+        self.attention(f"Урок зроблено! 🎉\nНових слів: {stats['new']}, правильних: {stats['right']}", 5, jumps=3)
+        self.celebrate(gains)
+
+    def set_goal_date(self, day: dt.date) -> None:
+        self.config["goal_date"] = day.isoformat()
+        save_config(self.config)
+        self.say(f"Нова мета: {day:%d.%m.%Y} 🎯", 3)
+
+    def ask_goal_date(self) -> None:
+        GLib.idle_add(self.goal_dialog)
+
+    def goal_dialog(self) -> bool:
+        dialog = self.dialog("Мета навчання")
+        dialog.add_buttons("Скасувати", Gtk.ResponseType.CANCEL, "Зберегти", Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.add(Gtk.Label(label="До якого дня вивчити всі слова?"))
+        calendar = Gtk.Calendar()
+        goal = self.goal_date()
+        calendar.select_month(goal.month - 1, goal.year)
+        calendar.select_day(goal.day)
+        box.add(calendar)
+        dialog.show_all()
+        response = dialog.run()
+        year, month0, day = calendar.get_date()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            chosen = dt.date(year, month0 + 1, day)
+            if chosen <= today():
+                self.say("Мета має бути в майбутньому 🙂", 3)
+            else:
+                self.set_goal_date(chosen)
+        return False
+
+    def check_lesson_nudge(self) -> None:
+        """Нагадує про урок кілька разів на день, якщо він ще не пройдений."""
+        if (not self.config["lesson_nudges"] or self.config["dnd"] or self.quitting
+                or self.state in ("sleep", "game") or self.lesson_window is not None):
+            return
+        now = dt.datetime.now()
+        if now.hour < LESSON_NUDGE_FROM_HOUR:
+            return
+        day = today().isoformat()
+        if self.lesson_nudges["day"] != day:
+            self.lesson_nudges = {"day": day, "count": 0, "last": -math.inf}
+        if (self.lesson_nudges["count"] >= LESSON_NUDGES_PER_DAY
+                or time.monotonic() - self.lesson_nudges["last"] < LESSON_NUDGE_EVERY_S):
+            return
+        idle = self.idle.seconds()
+        if idle is not None and idle > 60:  # тебе немає за комп'ютером — нагадаємо пізніше
+            return
+        plan = self.lesson_plan()
+        if plan.done or not (plan.new or plan.reviews):
+            return
+        self.lesson_nudges["count"] = int(self.lesson_nudges["count"]) + 1
+        self.lesson_nudges["last"] = time.monotonic()
+        self.queue_say(f"{self.lesson_label()} 📚\nПравий клік → Урок. До мети {plan.days_left} дн.!", 7)
+
     # --- Games ------------------------------------------------------------
     def answer_quiz(self, question: words.Question, chosen: str) -> None:
         self.wake_quietly()
         w = question.word
-        if chosen == question.correct:
+        correct = chosen == question.correct
+        was_known = words.box(self.tracker.p.word_book, w) >= words.KNOWN_BOX
+        gains = self.tracker.quiz_answer(w, correct, today())
+        if correct:
             self.needs.cheer(15)
             self.needs.tire(3)
             self.start_jump(2)
-            self.say(f"Правильно! 🎉\n{w.en} — {w.uk}", 3.5)
+            learned = not was_known and words.box(self.tracker.p.word_book, w) >= words.KNOWN_BOX
+            streak = self.tracker.p.quiz_streak
+            extra = "\n🎓 Слово вивчено!" if learned else (f"\n🔥 {streak} поспіль!" if streak >= 3 else "")
+            self.say(f"Правильно! 🎉\n{w.en} — {w.uk}{extra}", 3.5)
         else:
             self.needs.cheer(5)  # playing is fun even when you miss
-            self.say(f"Майже! 🙂\n{w.en} — {w.uk}", 4)
+            self.say(f"Майже! 🙂\n{w.en} — {w.uk}\nЯ спитаю його ще раз", 4)
         self.save_life()
+        self.celebrate(gains)
 
     def start_game(self) -> None:
         if self.game:
@@ -955,6 +1241,9 @@ class Buddy(Gtk.Window):
         self.set_state("rest", 4)
         self.start_jump()
         self.say(text, 4)
+        if score:
+            self.celebrate(self.tracker.record_best("catch", score))
+            self.record("catch", score)
 
     # --- Pomodoro ---------------------------------------------------------
     def pomodoro_label(self) -> str:
@@ -979,12 +1268,106 @@ class Buddy(Gtk.Window):
             count = self.pomo["count"]
             rest_s = POMODORO_LONG_BREAK_S if count % 4 == 0 else POMODORO_BREAK_S
             self.pomo.update(phase="break", ends=now + rest_s)
+            self.play_sound("break")
             self.attention(f"🍅 Помідорка №{count} готова!\nПерерва {rest_s // 60} хв ☕\n"
                            "Встань, розімнись, попий води", 10, jumps=2)
             self.go_to_center()
+            self.record("pomodoro")
         else:
             self.pomo.update(phase="work", ends=now + POMODORO_WORK_S)
+            self.play_sound("done")
             self.attention(f"Перерва скінчилась 💪\nНаступні {POMODORO_WORK_S // 60} хв — фокус!", 5)
+
+    # --- Reminders --------------------------------------------------------
+    def reminders_menu(self) -> Gtk.Menu:
+        menu = Gtk.Menu()
+        menu.append(self.menu_item("Додати…", self.ask_reminder))
+        if self.reminders:
+            menu.append(Gtk.SeparatorMenuItem())
+        now = dt.datetime.now()
+        for reminder in self.reminders:
+            when = reminder.when()
+            stamp = f"{when:%H:%M}" if when.date() == now.date() else f"{when:%d.%m %H:%M}"
+            sub = Gtk.Menu()
+            sub.append(self.menu_item("Видалити", lambda r=reminder: self.delete_reminder(r)))
+            menu.append(self.submenu_item(f"{stamp} — {reminder.text[:40]}", sub))
+        return menu
+
+    def ask_reminder(self) -> None:
+        GLib.idle_add(self.reminder_dialog)
+
+    def reminder_dialog(self) -> bool:
+        dialog = self.dialog("Нове нагадування")
+        dialog.add_buttons("Скасувати", Gtk.ResponseType.CANCEL, "Зберегти", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        box = dialog.get_content_area()
+        box.add(Gtk.Label(label="Про що нагадати?", xalign=0))
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Наприклад: подзвонити бабусі")
+        entry.set_activates_default(True)
+        box.add(entry)
+
+        soon = dt.datetime.now() + dt.timedelta(minutes=30)
+        at_row = Gtk.Box(spacing=6)
+        at_radio = Gtk.RadioButton.new_with_label(None, "О котрій:")
+        hour = Gtk.SpinButton.new_with_range(0, 23, 1)
+        hour.set_value(soon.hour)
+        minute = Gtk.SpinButton.new_with_range(0, 59, 1)
+        minute.set_value(soon.minute)
+        for widget in (at_radio, hour, Gtk.Label(label=":"), minute):
+            at_row.pack_start(widget, False, False, 0)
+        box.add(at_row)
+        in_row = Gtk.Box(spacing=6)
+        in_radio = Gtk.RadioButton.new_with_label_from_widget(at_radio, "Через (хвилин):")
+        minutes = Gtk.SpinButton.new_with_range(1, 24 * 60, 5)
+        minutes.set_value(30)
+        in_row.pack_start(in_radio, False, False, 0)
+        in_row.pack_start(minutes, False, False, 0)
+        box.add(in_row)
+        # Changing a number picks its option, so you do not have to click the circle too.
+        hour.connect("value-changed", lambda _w: at_radio.set_active(True))
+        minute.connect("value-changed", lambda _w: at_radio.set_active(True))
+        minutes.connect("value-changed", lambda _w: in_radio.set_active(True))
+        in_radio.set_active(True)
+
+        dialog.show_all()
+        response = dialog.run()
+        text = entry.get_text().strip()
+        now = dt.datetime.now()
+        if in_radio.get_active():
+            when = now + dt.timedelta(minutes=minutes.get_value_as_int())
+        else:
+            when = reminders.next_time(hour.get_value_as_int(), minute.get_value_as_int(), now)
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK and text:
+            self.reminders = sorted([*self.reminders, reminders.Reminder(text[:200], when.timestamp())],
+                                    key=lambda r: r.at)
+            reminders.save(self.reminders)
+            day = "" if when.date() == now.date() else " завтра"
+            self.say(f"Нагадаю{day} о {when:%H:%M} ⏰", 3)
+        return False
+
+    def delete_reminder(self, reminder: reminders.Reminder) -> None:
+        self.reminders = [r for r in self.reminders if r != reminder]
+        reminders.save(self.reminders)
+        self.say("Видалив нагадування 🗑", 2)
+
+    def check_reminders(self) -> None:
+        now = time.time()
+        due, waiting = reminders.split_due(self.reminders, now)
+        if not due:
+            return
+        self.reminders = waiting
+        reminders.save(waiting)
+        for i, reminder in enumerate(due):
+            late = "\n(трохи запізнився: я був вимкнений)" if now - reminder.at > 600 else ""
+            if i == 0:
+                self.attention(f"⏰ {reminder.text}{late}", 15, jumps=3)
+            else:
+                self.queue_say(f"⏰ {reminder.text}{late}", 10)
+        self.play_sound("reminder")
+        self.go_to_center()
+        self.record("reminder", len(due))
 
     # --- Claude Code ------------------------------------------------------
     def on_claude_event(self, _fd: int, _condition: GLib.IOCondition) -> bool:
@@ -994,15 +1377,21 @@ class Buddy(Gtk.Window):
         return True  # keep listening
 
     def handle_claude(self, event: dict) -> None:
-        if not self.config["claude"] or self.quitting:
+        kind = event.get("event")
+        if kind == "quit":  # install.py --uninstall asks us to leave
+            self.quit_buddy()
+            return
+        if self.quitting:
             return
         project = Path(str(event.get("cwd") or "")).name
         where = f"\n({project})" if project else ""
-        kind = event.get("event")
-        if kind == "stop":
+        tool = str(event.get("tool") or "")
+        if kind == "stop" and self.config["claude"]:
             self.needs.cheer(2)  # finishing things together is nice
+            self.play_sound("done")
             self.attention(random.choice(DONE_PHRASES) + where, 5)
-        elif kind == "notify":
+            self.record("claude")
+        elif kind == "notify" and self.config["claude"]:
             message = str(event.get("message") or "")
             lower = message.lower()
             if "permission" in lower:
@@ -1011,29 +1400,59 @@ class Buddy(Gtk.Window):
                 text = "Claude чекає на тебе ⌨️"
             else:
                 text = message[:120] or "Claude кличе тебе 🔔"
+            self.play_sound("attention")
             self.attention(text + where, 8, jumps=2)
+        elif kind == "tool" and self.config["claude_tools"] and not self.config["dnd"]:
+            text = claude_link.describe_tool(tool, str(event.get("detail") or ""))
+            if text:
+                self.say_light(text, 2.5)
+        elif kind == "fail" and self.config["claude_tools"] and not self.config["dnd"]:
+            self.say_light(claude_link.describe_failure(tool), 3, force=True)
 
-    # --- Sleep ------------------------------------------------------------
+    # --- Sleep and breaks -------------------------------------------------
     def check_sleep(self) -> None:
         idle = self.idle.seconds()
         if idle is None:
             return
+        self.track_breaks(idle)
         now = dt.datetime.now()
         if self.state == "sleep":
             if idle < WAKE_IDLE_S:
                 self.wake(random.choice(WAKE_PHRASES))
             return
-        if self.state in ("rest", "walk") and self.menu is None and not self.quitting:
+        # With music on it dances instead of dozing off, even if you just listen.
+        if self.state in ("rest", "walk") and self.menu is None and not self.quitting and not self.track:
             limit = SLEEP_IDLE_NIGHT_S if is_night(now) else SLEEP_IDLE_S
             if idle >= limit:
                 self.fall_asleep()
                 return
-        # Still at the computer late at night: say so once per night.
-        if is_night(now) and idle < 60 and not self.config["dnd"]:
+        if is_night(now) and idle < 60:
             night = (now - dt.timedelta(hours=NIGHT_HOURS[1])).date().isoformat()
-            if night != self.night_key:
+            if 2 <= now.hour < 5 and night != self.owl_key:
+                self.owl_key = night
+                self.record("night")
+            # Still at the computer late at night: say so once per night.
+            if night != self.night_key and not self.config["dnd"]:
                 self.night_key = night
                 self.queue_say(random.choice(NIGHT_PHRASES), 4)
+
+    def track_breaks(self, idle: float) -> None:
+        """Counts how long you have been at the computer without a real break."""
+        now = time.time()
+        if idle >= BREAK_IDLE_S:
+            self.active_since = None
+            self.next_break_nag = 0.0
+            return
+        if self.active_since is None:
+            self.active_since = now - idle
+        worked = now - self.active_since
+        if (worked >= WORK_NO_BREAK_S and now >= self.next_break_nag and not self.pomo
+                and not self.config["dnd"] and self.state != "sleep"):
+            self.next_break_nag = now + 3600
+            self.queue_say(f"Ти вже {duration_text(worked)} без перерви 🙆\nВстань, розімнись!", 6)
+
+    def worked_seconds(self) -> float | None:
+        return time.time() - self.active_since if self.active_since else None
 
     def fall_asleep(self) -> None:
         self.set_state("sleep", math.inf)
@@ -1050,6 +1469,69 @@ class Buddy(Gtk.Window):
     def wake_quietly(self) -> None:
         if self.state == "sleep":
             self.set_state("rest", 3)
+
+    # --- Music ------------------------------------------------------------
+    def check_music(self) -> None:
+        self.track = self.music.now_playing()
+        if (self.track and self.track != self.announced_track and self.can_chat()
+                and not self.phrase and not self.queue):
+            self.announced_track = self.track
+            artist = f"\n{self.track.artist}" if self.track.artist else ""
+            self.say(f"🎵 {self.track.title}{artist}", 4)
+
+    def dancing(self) -> bool:
+        return self.track is not None and self.state == "rest" and not self.quitting
+
+    # --- Commits and the computer -----------------------------------------
+    def git_roots(self) -> list[Path]:
+        roots = self.config["git_roots"] or GIT_DEFAULT_ROOTS
+        return [Path(r).expanduser() for r in roots if Path(r).expanduser().is_dir()]
+
+    def check_git(self) -> None:
+        if self.git_busy or not self.config["git_reminders"] or self.config["dnd"]:
+            return
+        roots = self.git_roots()
+        if not roots:
+            return
+        self.git_busy = True
+        self.in_background(lambda: gitwatch.stale_repos(roots, time.time(), GIT_STALE_S), self.on_git)
+
+    def on_git(self, stale: list | None, error: Exception | None) -> bool:
+        self.git_busy = False
+        if error:
+            log(f"git check failed: {error}")
+        if not stale or self.config["dnd"] or self.quitting:
+            return False
+        now = time.monotonic()
+        if now - self.git_last < GIT_GAP_S:
+            return False
+        for repo, age in stale:
+            if now - self.git_warned.get(str(repo), -math.inf) < GIT_REPEAT_S:
+                continue
+            self.git_warned[str(repo)] = now
+            self.git_last = now
+            self.queue_say(f"У {repo.name} зміни без коміту\nвже {duration_text(age)} 💾 Закомітиш?", 6)
+            break
+        return False
+
+    def warn_once(self, key: str, every_s: float, text: str) -> None:
+        now = time.monotonic()
+        if now - self.warned.get(key, -math.inf) >= every_s:
+            self.warned[key] = now
+            self.queue_say(text, 5)
+
+    def check_system(self) -> None:
+        if self.config["dnd"] or self.quitting:
+            return
+        temp = sysinfo.cpu_temp()
+        if temp is not None and temp >= CPU_HOT_C:
+            self.warn_once("hot", 30 * 60, f"Процесор гарячий: {temp:.0f}° 🥵\nМоже, щось зависло?")
+        ram = sysinfo.memory_used()
+        if ram is not None and ram >= RAM_FULL_PCT:
+            self.warn_once("ram", 30 * 60, f"Пам'ять майже заповнена: {ram:.0f}% 🧠\nЗакрий зайві вкладки")
+        disk = sysinfo.disk_free()
+        if disk is not None and (disk[0] < DISK_LOW_GB or disk[1] < 5):
+            self.warn_once("disk", 6 * 3600, f"На диску лишилось {disk[0]:.1f} ГБ 💽\nЧас прибрати")
 
     # --- Restart ----------------------------------------------------------
     def check_code(self) -> None:
@@ -1158,8 +1640,21 @@ class Buddy(Gtk.Window):
 
     def say(self, text: str, seconds: float | None = None) -> None:
         self.phrase = text
+        self.light_phrase = False
         # Long quotes stay longer so there is time to read them.
         self.phrase_t = seconds if seconds is not None else max(4.0, len(text) / 10)
+
+    def say_light(self, text: str, seconds: float, force: bool = False) -> None:
+        """A minor note (what Claude is doing): never covers something important,
+        never wakes the buddy, and does not flicker when Claude edits many files in a row."""
+        now = time.monotonic()
+        if self.state == "sleep" or (self.phrase and not self.light_phrase):
+            return
+        if not force and now - self.last_light < TOOL_BUBBLE_GAP_S:
+            return
+        self.last_light = now
+        self.say(text, seconds)
+        self.light_phrase = True
 
     def queue_say(self, text: str, seconds: float | None = None) -> None:
         """Says it once the current phrase is over, so it does not cut anything off."""
@@ -1193,6 +1688,9 @@ class Buddy(Gtk.Window):
         return time.monotonic() - self.pointer_moved_at
 
     def choose_next_action(self) -> None:
+        if self.track and random.random() < 0.6:
+            self.set_state("rest", random.uniform(6, 12))  # good song: keep dancing on the spot
+            return
         # Chase only a cursor we can actually see right now, not a stale position.
         if (not self.config["dnd"] and random.random() < CHASE_CHANCE
                 and self.pointer_age() < POINTER_FRESH_S):
@@ -1249,6 +1747,16 @@ class Buddy(Gtk.Window):
             self.check_code()
         if self.pomo and time.monotonic() >= self.pomo["ends"]:
             self.pomodoro_next()
+        if self.every("reminders", 5):
+            self.check_reminders()
+        if self.every("music", MUSIC_CHECK_S):
+            self.check_music()
+        if self.every("git", GIT_CHECK_S):
+            self.check_git()
+        if self.every("system", SYSTEM_CHECK_S):
+            self.check_system()
+        if self.every("lesson", 5 * 60):
+            self.check_lesson_nudge()
 
     def tick(self) -> bool:
         dt = 1 / FPS
@@ -1295,6 +1803,11 @@ class Buddy(Gtk.Window):
             self.feed_t = max(0.0, self.feed_t - dt)
             if self.feed_t == 0:
                 self.start_jump()
+        if self.dancing():
+            self.dance_t += dt
+            if self.dance_t >= 60:
+                self.dance_t -= 60
+                self.record("dance_min")
 
         self.periodic()
 
@@ -1372,6 +1885,7 @@ class Buddy(Gtk.Window):
         else:
             # A click is a pat: it cheers the buddy up a little.
             self.needs.cheer(PET_AMOUNT)
+            self.tracker.add("pet", day=today())
             self.start_jump()
             pet = skins.PETS.get(self.config["pet"]) if self.config["pet"] else None
             if pet and random.random() < 0.3:
@@ -1392,24 +1906,35 @@ class Buddy(Gtk.Window):
         moving = held or self.state in ("walk", "chase", "game")  # held: legs dangle
         # Pixel art looks best with whole-pixel hops instead of smooth bobbing.
         bob = 2 if moving and not held and math.sin(self.step_phase) > 0 else 0
+        dancing = self.dancing()
+        sway = 0
+        beat = self.wobble * DANCE_BPM / 60  # beats since start
         if sleeping:
             bob = 1 if math.sin(self.wobble * 1.6) > 0 else 0  # slow breathing
+        elif dancing:
+            bob = 3 if math.sin(beat * 2 * math.pi) > 0 else 0  # a hop on every beat
+            sway = 2 if math.sin(beat * math.pi) > 0 else -2  # lean left, lean right
         elif self.phrase and not moving:
             bob = 1 if math.sin(self.wobble * 14) > 0 else 0  # "talking" wiggle
         jump = math.sin(math.pi * self.jump_t / 0.6) * 30 if self.jump_t > 0 else 0
         cy = CY - bob - jump
 
         self.draw_shadow(cr, jump)
-        self.draw_pet(cr, moving and not held)
+        self.draw_pet(cr, moving and not held, dancing)
+        cr.save()
+        cr.translate(sway, 0)
         self.draw_sprite(cr, cy, moving, sleeping)
         # Clothes first, then face and hat on top, the seasonal extra and umbrella last.
         for slot in ("body", "face", "head", "extra", "weather"):
             if slot in self.outfit:
                 self.draw_accessory(cr, self.outfit[slot], cy)
+        cr.restore()
         if self.feed_t > 0:
             self.draw_apple(cr, cy)
         if sleeping:
             self.draw_zzz(cr, cy)
+        if dancing:
+            self.draw_notes(cr, cy)
         if self.phrase:
             self.draw_bubble(cr, cy - self.accessories_top())
         return False
@@ -1434,7 +1959,7 @@ class Buddy(Gtk.Window):
             top += round(math.sin(self.wobble * 2.5) * acc.float_amp)  # whole pixels, like the rest
         self.draw_pixels(cr, acc.frame(self.wobble), acc.palette, left, top)
 
-    def draw_pet(self, cr: cairo.Context, moving: bool) -> None:
+    def draw_pet(self, cr: cairo.Context, moving: bool, dancing: bool = False) -> None:
         pet = skins.PETS.get(self.config["pet"]) if self.config["pet"] else None
         if pet is None or self.state == "held":  # while you carry the buddy, the pet waits
             return
@@ -1443,6 +1968,8 @@ class Buddy(Gtk.Window):
         height = pet.height * FINE_H
         ground = CY + BODY_HALF_H
         hop = 1 if moving and math.sin(self.step_phase * 1.3) > 0 else 0
+        if dancing:  # the pet dances too, half a beat later
+            hop = 2 if math.sin(self.wobble * DANCE_BPM / 60 * 2 * math.pi + math.pi) > 0 else 0
         # It walks behind the buddy and looks the same way.
         if self.facing >= 0:
             left, flip = CX - BODY_HALF_W - PET_GAP - width, False
@@ -1471,6 +1998,17 @@ class Buddy(Gtk.Window):
             layout.set_text("z" if phase < 0.5 else "Z", -1)
             cr.set_source_rgba(*INK, 1 - phase)
             cr.move_to(CX + BODY_HALF_W - 8 + phase * 22, cy - BODY_HALF_H - 10 - phase * 45)
+            PangoCairo.show_layout(cr, layout)
+
+    def draw_notes(self, cr: cairo.Context, cy: float) -> None:
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription("Sans Bold 11"))
+        for i, note in enumerate(("♪", "♫")):
+            phase = (self.wobble * 0.5 + i / 2) % 1  # each note floats up and fades out
+            side = -1 if i == 0 else 1
+            layout.set_text(note, -1)
+            cr.set_source_rgba(*ORANGE_DARK, 1 - phase)
+            cr.move_to(CX + side * (BODY_HALF_W + 4 + phase * 10) - 5, cy - BODY_HALF_H - phase * 35)
             PangoCairo.show_layout(cr, layout)
 
     def draw_shadow(self, cr: cairo.Context, jump: float) -> None:

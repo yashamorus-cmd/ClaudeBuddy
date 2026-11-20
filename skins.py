@@ -410,6 +410,121 @@ BODY: dict[str, Accessory] = {
     ),
 }
 
+# ---------------------------------------------------------------- нагороди
+# Ці аксесуари спершу закриті й відкриваються досягненнями (див. progress.py).
+HEAD.update({
+    "tomato_hat": Accessory(
+        name="Капелюх-помідорка",
+        art=(
+            ".......GG.G.......",
+            "......GGGGG.......",
+            ".....RRRRRRRR.....",
+            "....RRRWRRRRRR....",
+            "...RRRRRRRRRRRR...",
+        ),
+        palette={"G": (0.25, 0.60, 0.25), "R": (0.88, 0.20, 0.18), "W": (1.00, 0.70, 0.65)},
+        row=-5,
+    ),
+    "grad_cap": Accessory(
+        name="Шапка випускника",
+        art=(
+            ".......KKKK.......",
+            "...KKKKKKKKKKKK...",
+            "KKKKKKKKKKKKKKKKKK",
+            "....KKKKKKKKKK..Y.",
+            "....KKKKKKKKKK..Y.",
+            "...............YY.",
+        ),
+        palette={"K": (0.12, 0.12, 0.16), "Y": (1.00, 0.82, 0.15)},
+        row=-6,
+    ),
+    "halo": Accessory(
+        name="Німб",
+        art=(
+            "....YYYYYYYYYY....",
+            "...Y..........Y...",
+            "....YYYYYYYYYY....",
+        ),
+        palette={"Y": (1.00, 0.88, 0.30)},
+        row=-8,
+        float_amp=2.0,
+    ),
+    "laurel": Accessory(
+        name="Золотий лавровий вінок",
+        art=(
+            "..Y.Y........Y.Y..",
+            ".YYY..........YYY.",
+            "YY.Y..........Y.YY",
+            "YYY............YYY",
+            ".YY............YY.",
+        ),
+        palette={"Y": (1.00, 0.80, 0.15)},
+        row=-3,
+    ),
+    "sweatband": Accessory(
+        name="Пов'язка спортсмена",
+        art=(
+            "...WWWWRRRRWWWWW..",
+            "...............WW.",
+        ),
+        palette={"W": (0.97, 0.97, 0.97), "R": (0.85, 0.15, 0.20)},
+        row=0,
+    ),
+})
+FACE.update({
+    "star_glasses": Accessory(
+        name="Окуляри-зірки",
+        art=(
+            ".....Y......Y.....",
+            "...YYYYYKKYYYYY...",
+            "....YYY....YYY....",
+            "....Y.Y....Y.Y....",
+        ),
+        palette={"Y": (1.00, 0.84, 0.15), "K": (0.30, 0.25, 0.10)},
+        row=1,
+    ),
+})
+BODY.update({
+    "disco": Accessory(
+        name="Диско-піджак",
+        art=(
+            ".PPPPPPPPPPPPPPPP.",
+            ".PWPPSPPPPPPSPPWP.",
+            "...PPPPSPPSPPPP...",
+            "...PPPPPPPPPPPP...",
+        ),
+        frames=((
+            ".PPPPPPPPPPPPPPPP.",
+            ".PSPPWPPPPPPWPPSP.",
+            "...PPPPWPPWPPPP...",
+            "...PPPPPPPPPPPP...",
+        ),),
+        palette={"P": (0.55, 0.20, 0.75), "W": (1.00, 1.00, 1.00), "S": (0.80, 0.80, 0.95)},
+        row=4,
+        fps=3,
+    ),
+    "royal_cape": Accessory(
+        name="Королівська мантія",
+        art=(
+            ".WWKWWKWWKWWKWWKW.",
+            ".PP............PP.",
+            ".PP............PP.",
+            ".PP............PP.",
+            "PPP............PPP",
+        ),
+        palette={"W": (0.97, 0.97, 0.97), "K": (0.10, 0.10, 0.10), "P": (0.45, 0.10, 0.55)},
+        row=4,
+    ),
+})
+
+# Закриті аксесуари: слот -> {аксесуар -> досягнення, яке його відкриває}.
+LOCKED: dict[str, dict[str, str]] = {
+    "head": {"tomato_hat": "pomo_25", "grad_cap": "words_40", "halo": "claude_50", "sweatband": "catch_15",
+             "laurel": "words_1500"},
+    "face": {"star_glasses": "quiz_streak_5"},
+    "body": {"disco": "dance_30", "royal_cape": "level_5"},
+}
+
 # Слоти, які показуються в меню: id слота -> (назва, аксесуари)
 SLOTS: dict[str, tuple[str, dict[str, Accessory]]] = {
     "head": ("Головний убір", HEAD),
